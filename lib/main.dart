@@ -8,6 +8,8 @@ import 'package:rtmp_streaming/camera.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'widgets/galuh_cast_logo.dart';
+
 const _serverBaseUrl = 'rtmp://ams.ciamiskab.go.id/live';
 const _defaultStreamId = 'Live_5';
 

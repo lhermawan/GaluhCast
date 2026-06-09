@@ -503,6 +503,37 @@ class _BroadcastPageState extends State<BroadcastPage>
     );
   }
 
+  Widget _cameraPreview() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final previewAspectRatio = _cameraController.value.aspectRatio;
+        if (previewAspectRatio <= 0 ||
+            constraints.maxWidth <= 0 ||
+            constraints.maxHeight <= 0) {
+          return CameraPreview(_cameraController);
+        }
+
+        final containerAspectRatio =
+            constraints.maxWidth / constraints.maxHeight;
+        final scale = containerAspectRatio > previewAspectRatio
+            ? containerAspectRatio / previewAspectRatio
+            : previewAspectRatio / containerAspectRatio;
+
+        return ClipRect(
+          child: Transform.scale(
+            scale: scale,
+            child: Center(
+              child: AspectRatio(
+                aspectRatio: previewAspectRatio,
+                child: CameraPreview(_cameraController),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _preview() {
     return Container(
       margin: const EdgeInsets.all(12),
@@ -519,14 +550,7 @@ class _BroadcastPageState extends State<BroadcastPage>
         fit: StackFit.expand,
         children: [
           if (_isInitialized)
-            FittedBox(
-              fit: BoxFit.cover,
-              child: SizedBox(
-                width: 1,
-                height: _cameraController.value.aspectRatio,
-                child: CameraPreview(_cameraController),
-              ),
-            )
+            _cameraPreview()
           else
             const Center(child: CircularProgressIndicator()),
           Positioned(

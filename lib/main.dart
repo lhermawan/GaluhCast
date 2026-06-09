@@ -591,7 +591,15 @@ class _BroadcastPageState extends State<BroadcastPage>
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
       child: Row(
         children: [
-          const GaluhCastLogo(size: 44),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.asset(
+              'assets/images/logo.png',
+              width: 44,
+              height: 44,
+              fit: BoxFit.cover,
+            ),
+          ),
           const SizedBox(width: 12),
           const Expanded(
             child: Column(

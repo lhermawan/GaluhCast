@@ -8,6 +8,8 @@ import 'package:rtmp_streaming/camera.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'widgets/galuh_cast_logo.dart';
+
 const _serverBaseUrl = 'rtmp://ams.ciamiskab.go.id/live';
 const _defaultStreamId = 'Live_5';
 
@@ -480,8 +482,8 @@ class _BroadcastPageState extends State<BroadcastPage>
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
       child: Row(
         children: [
-          const Icon(Icons.cast_connected, color: Color(0xFF18A999)),
-          const SizedBox(width: 10),
+          const GaluhCastLogo(size: 44),
+          const SizedBox(width: 12),
           const Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

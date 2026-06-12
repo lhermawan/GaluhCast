@@ -208,6 +208,34 @@ const _profiles = <BroadcastProfile>[
   ),
 ];
 
+enum AntMediaConnectionStatus {
+  idle,
+  connecting,
+  connected,
+  disconnected,
+  error,
+}
+
+class AntMediaServerStatus {
+  const AntMediaServerStatus({
+    required this.status,
+    required this.title,
+    required this.detail,
+    required this.icon,
+    required this.color,
+    this.checkedAt,
+  });
+
+  final AntMediaConnectionStatus status;
+  final String title;
+  final String detail;
+  final IconData icon;
+  final Color color;
+  final DateTime? checkedAt;
+
+  bool get isConnected => status == AntMediaConnectionStatus.connected;
+}
+
 class BroadcastPage extends StatefulWidget {
   const BroadcastPage({super.key});
 
@@ -224,6 +252,13 @@ class _BroadcastPageState extends State<BroadcastPage>
   CameraDescription? _selectedCamera;
   BroadcastProfile _profile = _profiles[2];
   StreamStatistics? _stats;
+  AntMediaServerStatus _serverStatus = const AntMediaServerStatus(
+    status: AntMediaConnectionStatus.idle,
+    title: 'Belum live',
+    detail: 'Tekan Mulai Live untuk mengirim stream ke Ant Media Server.',
+    icon: Icons.cloud_queue,
+    color: Colors.white54,
+  );
   Timer? _statsTimer;
   Timer? _clockTimer;
   DateTime? _startedAt;
@@ -232,6 +267,7 @@ class _BroadcastPageState extends State<BroadcastPage>
   bool _audioEnabled = true;
   bool _flashEnabled = false;
   bool _rtmpPingEnabled = true;
+  bool _ignoreNextRtmpStopEvent = false;
   int _bitrateKbps = _profiles[2].defaultBitrateKbps;
   int _fps = 30;
   String? _statusMessage;
@@ -294,8 +330,25 @@ class _BroadcastPageState extends State<BroadcastPage>
   void _onCameraChanged() {
     if (!mounted) return;
     final event = _cameraController.value.event;
-    if (event is Map && event['eventType'] == 'rtmp_stopped' && _isStreaming) {
-      _stopTimers();
+    if (event is Map) {
+      final eventType = event['eventType']?.toString().toLowerCase() ?? '';
+      if (eventType.contains('rtmp_stopped') ||
+          eventType.contains('disconnect') ||
+          eventType.contains('closed')) {
+        _stopTimers();
+        if (_ignoreNextRtmpStopEvent) {
+          _ignoreNextRtmpStopEvent = false;
+        } else {
+          _setServerStatus(
+            AntMediaConnectionStatus.disconnected,
+            title: 'Terputus dari Ant Media Server',
+            detail:
+                'Koneksi RTMP berhenti. Cek jaringan, stream ID, dan server.',
+            icon: Icons.cloud_off,
+            color: const Color(0xFFFFC857),
+          );
+        }
+      }
     }
     setState(() {});
   }
@@ -444,6 +497,13 @@ class _BroadcastPageState extends State<BroadcastPage>
     }
     FocusManager.instance.primaryFocus?.unfocus();
     setState(() => _isBusy = true);
+    _setServerStatus(
+      AntMediaConnectionStatus.connecting,
+      title: 'Menghubungkan ke Ant Media Server',
+      detail: 'Mencoba masuk ke $_rtmpUrl ...',
+      icon: Icons.cloud_sync,
+      color: const Color(0xFFFFC857),
+    );
     try {
       if (Platform.isAndroid) {
         await _cameraController.setForceBt709Color(true);
@@ -472,8 +532,22 @@ class _BroadcastPageState extends State<BroadcastPage>
       await WakelockPlus.enable();
       _startedAt = DateTime.now();
       _startTimers();
+      _setServerStatus(
+        AntMediaConnectionStatus.connected,
+        title: 'Masuk Ant Media Server',
+        detail: 'RTMP berhasil tersambung ke $_rtmpUrl.',
+        icon: Icons.cloud_done,
+        color: const Color(0xFF18A999),
+      );
       _setStatus('Live ke $_rtmpUrl');
     } on CameraException catch (e) {
+      _setServerStatus(
+        AntMediaConnectionStatus.error,
+        title: 'Tidak masuk Ant Media Server',
+        detail: 'Gagal mulai live: ${e.description ?? e.code}',
+        icon: Icons.error_outline,
+        color: const Color(0xFFE84A5F),
+      );
       _setStatus('Gagal mulai live: ${e.description ?? e.code}');
     } finally {
       if (mounted) setState(() => _isBusy = false);
@@ -484,11 +558,20 @@ class _BroadcastPageState extends State<BroadcastPage>
     if (!_isStreaming || _isBusy) return;
     setState(() => _isBusy = true);
     try {
+      _ignoreNextRtmpStopEvent = true;
       await _cameraController.stopVideoStreaming();
       _stopTimers();
       await WakelockPlus.disable();
+      _setServerStatus(
+        AntMediaConnectionStatus.idle,
+        title: 'Belum live',
+        detail: 'Stream dihentikan dari aplikasi.',
+        icon: Icons.cloud_queue,
+        color: Colors.white54,
+      );
       _setStatus('Live dihentikan.');
     } on CameraException catch (e) {
+      _ignoreNextRtmpStopEvent = false;
       _setStatus('Gagal stop live: ${e.description ?? e.code}');
     } finally {
       if (mounted) setState(() => _isBusy = false);
@@ -515,7 +598,11 @@ class _BroadcastPageState extends State<BroadcastPage>
       if (!_isStreaming) return;
       try {
         final stats = await _cameraController.getStreamStatistics();
-        if (mounted) setState(() => _stats = stats);
+        if (!_isStreaming) return;
+        if (mounted) {
+          setState(() => _stats = stats);
+          _confirmServerAccepted(stats);
+        }
       } catch (_) {
         // Stats availability differs by platform and encoder state.
       }
@@ -537,6 +624,42 @@ class _BroadcastPageState extends State<BroadcastPage>
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  void _setServerStatus(
+    AntMediaConnectionStatus status, {
+    required String title,
+    required String detail,
+    required IconData icon,
+    required Color color,
+  }) {
+    if (!mounted) return;
+    setState(() {
+      _serverStatus = AntMediaServerStatus(
+        status: status,
+        title: title,
+        detail: detail,
+        icon: icon,
+        color: color,
+        checkedAt: DateTime.now(),
+      );
+    });
+  }
+
+  void _confirmServerAccepted(StreamStatistics stats) {
+    if (_serverStatus.detail.contains('menerima stream')) return;
+    final bitrate = stats.bitrate;
+    final fps = stats.fps;
+    final detail = bitrate != null && fps != null
+        ? 'Ant Media Server menerima stream ($bitrate kbps, $fps fps).'
+        : 'Ant Media Server menerima stream dari aplikasi ini.';
+    _setServerStatus(
+      AntMediaConnectionStatus.connected,
+      title: 'Masuk Ant Media Server',
+      detail: detail,
+      icon: Icons.cloud_done,
+      color: const Color(0xFF18A999),
+    );
   }
 
   Future<void> _selectProfile(BroadcastProfile profile) async {
@@ -687,6 +810,13 @@ class _BroadcastPageState extends State<BroadcastPage>
                 ),
                 _metricChip(Icons.speed, '${_stats?.fps ?? _fps} fps'),
                 _metricChip(
+                  _serverStatus.icon,
+                  _serverStatus.isConnected
+                      ? 'AMS masuk'
+                      : _serverStatus.title,
+                  color: _serverStatus.color,
+                ),
+                _metricChip(
                   Icons.crop_16_9,
                   _stats?.width != null && _stats?.height != null
                       ? '${_stats!.width}x${_stats!.height}'
@@ -752,6 +882,8 @@ class _BroadcastPageState extends State<BroadcastPage>
             _rtmpUrl,
             style: const TextStyle(color: Colors.white70, fontSize: 12),
           ),
+          const SizedBox(height: 12),
+          _antMediaStatusCard(),
           const SizedBox(height: 16),
           _sectionTitle('Kualitas'),
           Wrap(
@@ -888,20 +1020,62 @@ class _BroadcastPageState extends State<BroadcastPage>
     );
   }
 
-  Widget _metricChip(IconData icon, String label) {
+  Widget _metricChip(IconData icon, String label, {Color? color}) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.58),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white12),
+        border: Border.all(color: color ?? Colors.white12),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 16, color: Colors.white70),
+          Icon(icon, size: 16, color: color ?? Colors.white70),
           const SizedBox(width: 6),
           Text(label, style: const TextStyle(fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
+  Widget _antMediaStatusCard() {
+    final checkedAt = _serverStatus.checkedAt;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: _serverStatus.color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: _serverStatus.color.withValues(alpha: 0.55)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(_serverStatus.icon, color: _serverStatus.color),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _serverStatus.title,
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _serverStatus.detail,
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+                if (checkedAt != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    'Update ${_formatClock(checkedAt)}',
+                    style: const TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                ],
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -972,5 +1146,12 @@ class _BroadcastPageState extends State<BroadcastPage>
     final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
     final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
     return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+  }
+
+  String _formatClock(DateTime time) {
+    final hours = time.hour.toString().padLeft(2, '0');
+    final minutes = time.minute.toString().padLeft(2, '0');
+    final seconds = time.second.toString().padLeft(2, '0');
+    return '$hours:$minutes:$seconds';
   }
 }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -12,6 +13,9 @@ import 'widgets/galuh_cast_logo.dart';
 
 const _serverBaseUrl = 'rtmp://ams.ciamiskab.go.id/live';
 const _defaultStreamId = 'Live_5';
+const _antMediaBroadcastsApiUrl =
+    'https://ams.ciamiskab.go.id:5443/live/rest/v2/broadcasts/list/0/50';
+const _antMediaApiTimeout = Duration(seconds: 5);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -236,6 +240,46 @@ class AntMediaServerStatus {
   bool get isConnected => status == AntMediaConnectionStatus.connected;
 }
 
+class AntMediaBroadcast {
+  const AntMediaBroadcast({
+    required this.streamId,
+    required this.status,
+    required this.bitrate,
+    required this.width,
+    required this.height,
+    required this.receivedBytes,
+  });
+
+  factory AntMediaBroadcast.fromJson(Map<dynamic, dynamic> json) {
+    return AntMediaBroadcast(
+      streamId: json['streamId']?.toString() ?? '',
+      status: json['status']?.toString() ?? 'unknown',
+      bitrate: (json['bitrate'] as num?)?.round() ?? 0,
+      width: (json['width'] as num?)?.round() ?? 0,
+      height: (json['height'] as num?)?.round() ?? 0,
+      receivedBytes: (json['receivedBytes'] as num?)?.round() ?? 0,
+    );
+  }
+
+  final String streamId;
+  final String status;
+  final int bitrate;
+  final int width;
+  final int height;
+  final int receivedBytes;
+
+  bool get isBroadcasting => status.toLowerCase() == 'broadcasting';
+
+  String get resolution => width > 0 && height > 0 ? '${width}x$height' : '-';
+}
+
+class AntMediaBroadcastLookup {
+  const AntMediaBroadcastLookup({this.broadcast, this.error});
+
+  final AntMediaBroadcast? broadcast;
+  final String? error;
+}
+
 class BroadcastPage extends StatefulWidget {
   const BroadcastPage({super.key});
 
@@ -260,6 +304,7 @@ class _BroadcastPageState extends State<BroadcastPage>
     color: Colors.white54,
   );
   Timer? _statsTimer;
+  Timer? _amsStatusTimer;
   Timer? _clockTimer;
   DateTime? _startedAt;
 
@@ -299,6 +344,7 @@ class _BroadcastPageState extends State<BroadcastPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _statsTimer?.cancel();
+    _amsStatusTimer?.cancel();
     _clockTimer?.cancel();
     _streamIdController.dispose();
     WakelockPlus.disable();
@@ -488,6 +534,103 @@ class _BroadcastPageState extends State<BroadcastPage>
     await _saveSettings();
   }
 
+  Future<AntMediaBroadcastLookup> _fetchAntMediaBroadcast() async {
+    final streamId = _streamIdController.text.trim();
+    final client = HttpClient()..connectionTimeout = _antMediaApiTimeout;
+
+    try {
+      final request = await client
+          .getUrl(Uri.parse(_antMediaBroadcastsApiUrl))
+          .timeout(_antMediaApiTimeout);
+      final response = await request.close().timeout(_antMediaApiTimeout);
+      final body = await response.transform(utf8.decoder).join().timeout(
+        _antMediaApiTimeout,
+      );
+
+      if (response.statusCode != HttpStatus.ok) {
+        return AntMediaBroadcastLookup(
+          error: 'API AMS gagal (${response.statusCode}): $body',
+        );
+      }
+
+      final decoded = jsonDecode(body);
+      if (decoded is! List) {
+        return const AntMediaBroadcastLookup(
+          error: 'Response API AMS tidak sesuai format list broadcast.',
+        );
+      }
+
+      for (final item in decoded) {
+        if (item is Map && item['streamId']?.toString() == streamId) {
+          return AntMediaBroadcastLookup(
+            broadcast: AntMediaBroadcast.fromJson(item),
+          );
+        }
+      }
+
+      return AntMediaBroadcastLookup(
+        error: 'Stream ID $streamId tidak ditemukan di API AMS.',
+      );
+    } on TimeoutException {
+      return AntMediaBroadcastLookup(
+        error:
+            'API AMS tidak merespons dalam ${_antMediaApiTimeout.inSeconds} detik.',
+      );
+    } on SocketException catch (e) {
+      return AntMediaBroadcastLookup(
+        error: 'API AMS tidak bisa dihubungi: ${e.message}',
+      );
+    } on FormatException catch (e) {
+      return AntMediaBroadcastLookup(
+        error: 'Response API AMS bukan JSON valid: ${e.message}',
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _refreshAntMediaStatus() async {
+    if (!_isStreaming) return;
+    final lookup = await _fetchAntMediaBroadcast();
+    if (!mounted || !_isStreaming) return;
+
+    final error = lookup.error;
+    if (error != null) {
+      _setServerStatus(
+        AntMediaConnectionStatus.error,
+        title: 'Tidak masuk Ant Media Server',
+        detail: error,
+        icon: Icons.error_outline,
+        color: const Color(0xFFE84A5F),
+      );
+      return;
+    }
+
+    final broadcast = lookup.broadcast;
+    if (broadcast == null) return;
+
+    if (broadcast.isBroadcasting) {
+      _setServerStatus(
+        AntMediaConnectionStatus.connected,
+        title: 'Masuk Ant Media Server',
+        detail: 'API AMS status broadcasting untuk ${broadcast.streamId} '
+            '(${broadcast.resolution}, ${broadcast.bitrate} bps, '
+            '${broadcast.receivedBytes} bytes diterima).',
+        icon: Icons.cloud_done,
+        color: const Color(0xFF18A999),
+      );
+    } else {
+      _setServerStatus(
+        AntMediaConnectionStatus.connecting,
+        title: 'Belum masuk Ant Media Server',
+        detail: 'API AMS menemukan ${broadcast.streamId}, tetapi status masih '
+            '${broadcast.status}. Menunggu status broadcasting.',
+        icon: Icons.cloud_sync,
+        color: const Color(0xFFFFC857),
+      );
+    }
+  }
+
   Future<void> _startStreaming() async {
     if (!_isInitialized || _isBusy) return;
     final streamId = _streamIdController.text.trim();
@@ -505,6 +648,19 @@ class _BroadcastPageState extends State<BroadcastPage>
       color: const Color(0xFFFFC857),
     );
     try {
+      final apiLookup = await _fetchAntMediaBroadcast();
+      if (apiLookup.error != null) {
+        _setServerStatus(
+          AntMediaConnectionStatus.error,
+          title: 'Tidak masuk Ant Media Server',
+          detail: apiLookup.error!,
+          icon: Icons.error_outline,
+          color: const Color(0xFFE84A5F),
+        );
+        _setStatus(apiLookup.error!);
+        return;
+      }
+
       if (Platform.isAndroid) {
         await _cameraController.setForceBt709Color(true);
         await _cameraController.setRtmpShouldSendPings(_rtmpPingEnabled);
@@ -533,13 +689,15 @@ class _BroadcastPageState extends State<BroadcastPage>
       _startedAt = DateTime.now();
       _startTimers();
       _setServerStatus(
-        AntMediaConnectionStatus.connected,
-        title: 'Masuk Ant Media Server',
-        detail: 'RTMP berhasil tersambung ke $_rtmpUrl.',
-        icon: Icons.cloud_done,
-        color: const Color(0xFF18A999),
+        AntMediaConnectionStatus.connecting,
+        title: 'Menunggu konfirmasi API AMS',
+        detail: 'RTMP mulai dikirim ke $_rtmpUrl. Menunggu status broadcasting '
+            'dari API Ant Media Server.',
+        icon: Icons.cloud_sync,
+        color: const Color(0xFFFFC857),
       );
-      _setStatus('Live ke $_rtmpUrl');
+      unawaited(_refreshAntMediaStatus());
+      _setStatus('Live dimulai, menunggu konfirmasi API AMS.');
     } on CameraException catch (e) {
       _setServerStatus(
         AntMediaConnectionStatus.error,
@@ -590,6 +748,7 @@ class _BroadcastPageState extends State<BroadcastPage>
 
   void _startTimers() {
     _statsTimer?.cancel();
+    _amsStatusTimer?.cancel();
     _clockTimer?.cancel();
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
@@ -601,18 +760,22 @@ class _BroadcastPageState extends State<BroadcastPage>
         if (!_isStreaming) return;
         if (mounted) {
           setState(() => _stats = stats);
-          _confirmServerAccepted(stats);
         }
       } catch (_) {
         // Stats availability differs by platform and encoder state.
       }
     });
+    _amsStatusTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      unawaited(_refreshAntMediaStatus());
+    });
   }
 
   void _stopTimers() {
     _statsTimer?.cancel();
+    _amsStatusTimer?.cancel();
     _clockTimer?.cancel();
     _statsTimer = null;
+    _amsStatusTimer = null;
     _clockTimer = null;
     _startedAt = null;
     _stats = null;
@@ -646,21 +809,6 @@ class _BroadcastPageState extends State<BroadcastPage>
     });
   }
 
-  void _confirmServerAccepted(StreamStatistics stats) {
-    if (_serverStatus.detail.contains('menerima stream')) return;
-    final bitrate = stats.bitrate;
-    final fps = stats.fps;
-    final detail = bitrate != null && fps != null
-        ? 'Ant Media Server menerima stream ($bitrate kbps, $fps fps).'
-        : 'Ant Media Server menerima stream dari aplikasi ini.';
-    _setServerStatus(
-      AntMediaConnectionStatus.connected,
-      title: 'Masuk Ant Media Server',
-      detail: detail,
-      icon: Icons.cloud_done,
-      color: const Color(0xFF18A999),
-    );
-  }
 
   Future<void> _selectProfile(BroadcastProfile profile) async {
     if (_isStreaming) {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -12,6 +13,9 @@ import 'widgets/galuh_cast_logo.dart';
 
 const _serverBaseUrl = 'rtmp://ams.ciamiskab.go.id/live';
 const _defaultStreamId = 'Live_5';
+const _antMediaBroadcastsApiUrl =
+    'https://ams.ciamiskab.go.id:5443/live/rest/v2/broadcasts/list/0/50';
+const _antMediaApiTimeout = Duration(seconds: 5);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -208,6 +212,74 @@ const _profiles = <BroadcastProfile>[
   ),
 ];
 
+enum AntMediaConnectionStatus {
+  idle,
+  connecting,
+  connected,
+  disconnected,
+  error,
+}
+
+class AntMediaServerStatus {
+  const AntMediaServerStatus({
+    required this.status,
+    required this.title,
+    required this.detail,
+    required this.icon,
+    required this.color,
+    this.checkedAt,
+  });
+
+  final AntMediaConnectionStatus status;
+  final String title;
+  final String detail;
+  final IconData icon;
+  final Color color;
+  final DateTime? checkedAt;
+
+  bool get isConnected => status == AntMediaConnectionStatus.connected;
+}
+
+class AntMediaBroadcast {
+  const AntMediaBroadcast({
+    required this.streamId,
+    required this.status,
+    required this.bitrate,
+    required this.width,
+    required this.height,
+    required this.receivedBytes,
+  });
+
+  factory AntMediaBroadcast.fromJson(Map<dynamic, dynamic> json) {
+    return AntMediaBroadcast(
+      streamId: json['streamId']?.toString() ?? '',
+      status: json['status']?.toString() ?? 'unknown',
+      bitrate: (json['bitrate'] as num?)?.round() ?? 0,
+      width: (json['width'] as num?)?.round() ?? 0,
+      height: (json['height'] as num?)?.round() ?? 0,
+      receivedBytes: (json['receivedBytes'] as num?)?.round() ?? 0,
+    );
+  }
+
+  final String streamId;
+  final String status;
+  final int bitrate;
+  final int width;
+  final int height;
+  final int receivedBytes;
+
+  bool get isBroadcasting => status.toLowerCase() == 'broadcasting';
+
+  String get resolution => width > 0 && height > 0 ? '${width}x$height' : '-';
+}
+
+class AntMediaBroadcastLookup {
+  const AntMediaBroadcastLookup({this.broadcast, this.error});
+
+  final AntMediaBroadcast? broadcast;
+  final String? error;
+}
+
 class BroadcastPage extends StatefulWidget {
   const BroadcastPage({super.key});
 
@@ -224,7 +296,15 @@ class _BroadcastPageState extends State<BroadcastPage>
   CameraDescription? _selectedCamera;
   BroadcastProfile _profile = _profiles[2];
   StreamStatistics? _stats;
+  AntMediaServerStatus _serverStatus = const AntMediaServerStatus(
+    status: AntMediaConnectionStatus.idle,
+    title: 'Belum live',
+    detail: 'Tekan Mulai Live untuk mengirim stream ke Ant Media Server.',
+    icon: Icons.cloud_queue,
+    color: Colors.white54,
+  );
   Timer? _statsTimer;
+  Timer? _amsStatusTimer;
   Timer? _clockTimer;
   DateTime? _startedAt;
 
@@ -232,6 +312,7 @@ class _BroadcastPageState extends State<BroadcastPage>
   bool _audioEnabled = true;
   bool _flashEnabled = false;
   bool _rtmpPingEnabled = true;
+  bool _ignoreNextRtmpStopEvent = false;
   int _bitrateKbps = _profiles[2].defaultBitrateKbps;
   int _fps = 30;
   String? _statusMessage;
@@ -263,6 +344,7 @@ class _BroadcastPageState extends State<BroadcastPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _statsTimer?.cancel();
+    _amsStatusTimer?.cancel();
     _clockTimer?.cancel();
     _streamIdController.dispose();
     WakelockPlus.disable();
@@ -294,8 +376,25 @@ class _BroadcastPageState extends State<BroadcastPage>
   void _onCameraChanged() {
     if (!mounted) return;
     final event = _cameraController.value.event;
-    if (event is Map && event['eventType'] == 'rtmp_stopped' && _isStreaming) {
-      _stopTimers();
+    if (event is Map) {
+      final eventType = event['eventType']?.toString().toLowerCase() ?? '';
+      if (eventType.contains('rtmp_stopped') ||
+          eventType.contains('disconnect') ||
+          eventType.contains('closed')) {
+        _stopTimers();
+        if (_ignoreNextRtmpStopEvent) {
+          _ignoreNextRtmpStopEvent = false;
+        } else {
+          _setServerStatus(
+            AntMediaConnectionStatus.disconnected,
+            title: 'Terputus dari Ant Media Server',
+            detail:
+                'Koneksi RTMP berhenti. Cek jaringan, stream ID, dan server.',
+            icon: Icons.cloud_off,
+            color: const Color(0xFFFFC857),
+          );
+        }
+      }
     }
     setState(() {});
   }
@@ -435,6 +534,103 @@ class _BroadcastPageState extends State<BroadcastPage>
     await _saveSettings();
   }
 
+  Future<AntMediaBroadcastLookup> _fetchAntMediaBroadcast() async {
+    final streamId = _streamIdController.text.trim();
+    final client = HttpClient()..connectionTimeout = _antMediaApiTimeout;
+
+    try {
+      final request = await client
+          .getUrl(Uri.parse(_antMediaBroadcastsApiUrl))
+          .timeout(_antMediaApiTimeout);
+      final response = await request.close().timeout(_antMediaApiTimeout);
+      final body = await response.transform(utf8.decoder).join().timeout(
+        _antMediaApiTimeout,
+      );
+
+      if (response.statusCode != HttpStatus.ok) {
+        return AntMediaBroadcastLookup(
+          error: 'API AMS gagal (${response.statusCode}): $body',
+        );
+      }
+
+      final decoded = jsonDecode(body);
+      if (decoded is! List) {
+        return const AntMediaBroadcastLookup(
+          error: 'Response API AMS tidak sesuai format list broadcast.',
+        );
+      }
+
+      for (final item in decoded) {
+        if (item is Map && item['streamId']?.toString() == streamId) {
+          return AntMediaBroadcastLookup(
+            broadcast: AntMediaBroadcast.fromJson(item),
+          );
+        }
+      }
+
+      return AntMediaBroadcastLookup(
+        error: 'Stream ID $streamId tidak ditemukan di API AMS.',
+      );
+    } on TimeoutException {
+      return AntMediaBroadcastLookup(
+        error:
+            'API AMS tidak merespons dalam ${_antMediaApiTimeout.inSeconds} detik.',
+      );
+    } on SocketException catch (e) {
+      return AntMediaBroadcastLookup(
+        error: 'API AMS tidak bisa dihubungi: ${e.message}',
+      );
+    } on FormatException catch (e) {
+      return AntMediaBroadcastLookup(
+        error: 'Response API AMS bukan JSON valid: ${e.message}',
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _refreshAntMediaStatus() async {
+    if (!_isStreaming) return;
+    final lookup = await _fetchAntMediaBroadcast();
+    if (!mounted || !_isStreaming) return;
+
+    final error = lookup.error;
+    if (error != null) {
+      _setServerStatus(
+        AntMediaConnectionStatus.error,
+        title: 'Tidak masuk Ant Media Server',
+        detail: error,
+        icon: Icons.error_outline,
+        color: const Color(0xFFE84A5F),
+      );
+      return;
+    }
+
+    final broadcast = lookup.broadcast;
+    if (broadcast == null) return;
+
+    if (broadcast.isBroadcasting) {
+      _setServerStatus(
+        AntMediaConnectionStatus.connected,
+        title: 'Masuk Ant Media Server',
+        detail: 'API AMS status broadcasting untuk ${broadcast.streamId} '
+            '(${broadcast.resolution}, ${broadcast.bitrate} bps, '
+            '${broadcast.receivedBytes} bytes diterima).',
+        icon: Icons.cloud_done,
+        color: const Color(0xFF18A999),
+      );
+    } else {
+      _setServerStatus(
+        AntMediaConnectionStatus.connecting,
+        title: 'Belum masuk Ant Media Server',
+        detail: 'API AMS menemukan ${broadcast.streamId}, tetapi status masih '
+            '${broadcast.status}. Menunggu status broadcasting.',
+        icon: Icons.cloud_sync,
+        color: const Color(0xFFFFC857),
+      );
+    }
+  }
+
   Future<void> _startStreaming() async {
     if (!_isInitialized || _isBusy) return;
     final streamId = _streamIdController.text.trim();
@@ -444,7 +640,27 @@ class _BroadcastPageState extends State<BroadcastPage>
     }
     FocusManager.instance.primaryFocus?.unfocus();
     setState(() => _isBusy = true);
+    _setServerStatus(
+      AntMediaConnectionStatus.connecting,
+      title: 'Menghubungkan ke Ant Media Server',
+      detail: 'Mencoba masuk ke $_rtmpUrl ...',
+      icon: Icons.cloud_sync,
+      color: const Color(0xFFFFC857),
+    );
     try {
+      final apiLookup = await _fetchAntMediaBroadcast();
+      if (apiLookup.error != null) {
+        _setServerStatus(
+          AntMediaConnectionStatus.error,
+          title: 'Tidak masuk Ant Media Server',
+          detail: apiLookup.error!,
+          icon: Icons.error_outline,
+          color: const Color(0xFFE84A5F),
+        );
+        _setStatus(apiLookup.error!);
+        return;
+      }
+
       if (Platform.isAndroid) {
         await _cameraController.setForceBt709Color(true);
         await _cameraController.setRtmpShouldSendPings(_rtmpPingEnabled);
@@ -472,8 +688,24 @@ class _BroadcastPageState extends State<BroadcastPage>
       await WakelockPlus.enable();
       _startedAt = DateTime.now();
       _startTimers();
-      _setStatus('Live ke $_rtmpUrl');
+      _setServerStatus(
+        AntMediaConnectionStatus.connecting,
+        title: 'Menunggu konfirmasi API AMS',
+        detail: 'RTMP mulai dikirim ke $_rtmpUrl. Menunggu status broadcasting '
+            'dari API Ant Media Server.',
+        icon: Icons.cloud_sync,
+        color: const Color(0xFFFFC857),
+      );
+      unawaited(_refreshAntMediaStatus());
+      _setStatus('Live dimulai, menunggu konfirmasi API AMS.');
     } on CameraException catch (e) {
+      _setServerStatus(
+        AntMediaConnectionStatus.error,
+        title: 'Tidak masuk Ant Media Server',
+        detail: 'Gagal mulai live: ${e.description ?? e.code}',
+        icon: Icons.error_outline,
+        color: const Color(0xFFE84A5F),
+      );
       _setStatus('Gagal mulai live: ${e.description ?? e.code}');
     } finally {
       if (mounted) setState(() => _isBusy = false);
@@ -484,11 +716,20 @@ class _BroadcastPageState extends State<BroadcastPage>
     if (!_isStreaming || _isBusy) return;
     setState(() => _isBusy = true);
     try {
+      _ignoreNextRtmpStopEvent = true;
       await _cameraController.stopVideoStreaming();
       _stopTimers();
       await WakelockPlus.disable();
+      _setServerStatus(
+        AntMediaConnectionStatus.idle,
+        title: 'Belum live',
+        detail: 'Stream dihentikan dari aplikasi.',
+        icon: Icons.cloud_queue,
+        color: Colors.white54,
+      );
       _setStatus('Live dihentikan.');
     } on CameraException catch (e) {
+      _ignoreNextRtmpStopEvent = false;
       _setStatus('Gagal stop live: ${e.description ?? e.code}');
     } finally {
       if (mounted) setState(() => _isBusy = false);
@@ -507,6 +748,7 @@ class _BroadcastPageState extends State<BroadcastPage>
 
   void _startTimers() {
     _statsTimer?.cancel();
+    _amsStatusTimer?.cancel();
     _clockTimer?.cancel();
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
@@ -515,17 +757,25 @@ class _BroadcastPageState extends State<BroadcastPage>
       if (!_isStreaming) return;
       try {
         final stats = await _cameraController.getStreamStatistics();
-        if (mounted) setState(() => _stats = stats);
+        if (!_isStreaming) return;
+        if (mounted) {
+          setState(() => _stats = stats);
+        }
       } catch (_) {
         // Stats availability differs by platform and encoder state.
       }
+    });
+    _amsStatusTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      unawaited(_refreshAntMediaStatus());
     });
   }
 
   void _stopTimers() {
     _statsTimer?.cancel();
+    _amsStatusTimer?.cancel();
     _clockTimer?.cancel();
     _statsTimer = null;
+    _amsStatusTimer = null;
     _clockTimer = null;
     _startedAt = null;
     _stats = null;
@@ -538,6 +788,27 @@ class _BroadcastPageState extends State<BroadcastPage>
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
   }
+
+  void _setServerStatus(
+    AntMediaConnectionStatus status, {
+    required String title,
+    required String detail,
+    required IconData icon,
+    required Color color,
+  }) {
+    if (!mounted) return;
+    setState(() {
+      _serverStatus = AntMediaServerStatus(
+        status: status,
+        title: title,
+        detail: detail,
+        icon: icon,
+        color: color,
+        checkedAt: DateTime.now(),
+      );
+    });
+  }
+
 
   Future<void> _selectProfile(BroadcastProfile profile) async {
     if (_isStreaming) {
@@ -687,6 +958,13 @@ class _BroadcastPageState extends State<BroadcastPage>
                 ),
                 _metricChip(Icons.speed, '${_stats?.fps ?? _fps} fps'),
                 _metricChip(
+                  _serverStatus.icon,
+                  _serverStatus.isConnected
+                      ? 'AMS masuk'
+                      : _serverStatus.title,
+                  color: _serverStatus.color,
+                ),
+                _metricChip(
                   Icons.crop_16_9,
                   _stats?.width != null && _stats?.height != null
                       ? '${_stats!.width}x${_stats!.height}'
@@ -752,6 +1030,8 @@ class _BroadcastPageState extends State<BroadcastPage>
             _rtmpUrl,
             style: const TextStyle(color: Colors.white70, fontSize: 12),
           ),
+          const SizedBox(height: 12),
+          _antMediaStatusCard(),
           const SizedBox(height: 16),
           _sectionTitle('Kualitas'),
           Wrap(
@@ -888,20 +1168,62 @@ class _BroadcastPageState extends State<BroadcastPage>
     );
   }
 
-  Widget _metricChip(IconData icon, String label) {
+  Widget _metricChip(IconData icon, String label, {Color? color}) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.58),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white12),
+        border: Border.all(color: color ?? Colors.white12),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 16, color: Colors.white70),
+          Icon(icon, size: 16, color: color ?? Colors.white70),
           const SizedBox(width: 6),
           Text(label, style: const TextStyle(fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
+  Widget _antMediaStatusCard() {
+    final checkedAt = _serverStatus.checkedAt;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: _serverStatus.color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: _serverStatus.color.withValues(alpha: 0.55)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(_serverStatus.icon, color: _serverStatus.color),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _serverStatus.title,
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _serverStatus.detail,
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+                if (checkedAt != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    'Update ${_formatClock(checkedAt)}',
+                    style: const TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                ],
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -972,5 +1294,12 @@ class _BroadcastPageState extends State<BroadcastPage>
     final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
     final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
     return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+  }
+
+  String _formatClock(DateTime time) {
+    final hours = time.hour.toString().padLeft(2, '0');
+    final minutes = time.minute.toString().padLeft(2, '0');
+    final seconds = time.second.toString().padLeft(2, '0');
+    return '$hours:$minutes:$seconds';
   }
 }
